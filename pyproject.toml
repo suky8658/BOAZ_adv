@@ -1,0 +1,13 @@
+[project]
+name = "sql-agent-0402"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "dotenv>=0.9.9",
+    "langchain-google-genai>=2.1.12",
+    "langgraph>=0.6.11",
+    "pydantic>=2.12.5",
+    "sqlalchemy>=2.0.48",
+]
