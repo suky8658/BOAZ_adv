@@ -1,69 +1,132 @@
-import os
-import pandas as pd
-from sqlalchemy import create_engine, text
-from sqlalchemy import create_engine
-from dotenv import load_dotenv
+from __future__ import annotations
 
-# .env 파일에 저장된 환경 변수(DB 접속 정보)를 불러옵니다.
+import os
+from dataclasses import dataclass
+from functools import lru_cache
+from typing import Literal
+
+import pandas as pd
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine, URL
+
 load_dotenv()
 
-def get_db_engine():
-    """
-    MySQL 데이터베이스 연결을 위한 SQLAlchemy Engine을 생성하여 반환합니다.
-    이 엔진은 GE 검증이나 SQL 실행 시 공통으로 사용됩니다.
-    """
-    db_user = os.getenv("DB_USER")
-    db_password = os.getenv("DB_PASSWORD")
-    db_host = os.getenv("DB_HOST")
-    db_port = os.getenv("DB_PORT", "3306")
-    db_name = os.getenv("DB_NAME")
+DBRole = Literal["source", "datamart"]
 
-    # SQLAlchemy 연결 문자열 (MySQL + pymysql 드라이버 사용)
-    # 형식: mysql+pymysql://유저명:비밀번호@호스트:포트/DB이름
-    database_url = f"mysql+pymysql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
 
+@dataclass(frozen=True)
+class DatabaseSettings:
+    role: DBRole
+    user: str | None
+    password: str | None
+    host: str | None
+    port: str
+    name: str | None
+
+    @property
+    def is_configured(self) -> bool:
+        return all([self.user, self.host, self.name])
+
+    @property
+    def url(self) -> str:
+        return URL.create(
+            drivername="mysql+pymysql",
+            username=self.user,
+            password=self.password or None,
+            host=self.host,
+            port=int(self.port),
+            database=self.name,
+        ).render_as_string(hide_password=False)
+
+
+def _env(
+    primary: str,
+    *,
+    fallback_keys: tuple[str, ...] = (),
+    default: str | None = None,
+) -> str | None:
+    for key in (primary, *fallback_keys):
+        value = os.getenv(key)
+        if value is not None:
+            return value
+    return default
+
+
+def get_database_settings(role: DBRole = "source") -> DatabaseSettings:
+    if role == "source":
+        return DatabaseSettings(
+            role="source",
+            user=_env("SOURCE_DB_USER", fallback_keys=("DB_USER",)),
+            password=_env("SOURCE_DB_PASSWORD", fallback_keys=("DB_PASSWORD",)),
+            host=_env("SOURCE_DB_HOST", fallback_keys=("DB_HOST",)),
+            port=_env("SOURCE_DB_PORT", fallback_keys=("DB_PORT",), default="3306") or "3306",
+            name=_env("SOURCE_DB_NAME", fallback_keys=("DB_NAME",)),
+        )
+
+    source = get_database_settings("source")
+    return DatabaseSettings(
+        role="datamart",
+        user=_env("DATAMART_DB_USER", fallback_keys=("SOURCE_DB_USER", "DB_USER"), default=source.user),
+        password=_env(
+            "DATAMART_DB_PASSWORD",
+            fallback_keys=("SOURCE_DB_PASSWORD", "DB_PASSWORD"),
+            default=source.password,
+        ),
+        host=_env("DATAMART_DB_HOST", fallback_keys=("SOURCE_DB_HOST", "DB_HOST"), default=source.host),
+        port=_env(
+            "DATAMART_DB_PORT",
+            fallback_keys=("SOURCE_DB_PORT", "DB_PORT"),
+            default=source.port,
+        )
+        or "3306",
+        name=_env("DATAMART_DB_NAME", default="analytics"),
+    )
+
+
+@lru_cache(maxsize=2)
+def get_db_engine(role: DBRole = "source") -> Engine:
+    settings = get_database_settings(role)
+    if not settings.is_configured:
+        missing = [
+            key
+            for key, value in {
+                "user": settings.user,
+                "host": settings.host,
+                "database": settings.name,
+            }.items()
+            if not value
+        ]
+        raise ValueError(
+            f"{role} DB configuration is incomplete. Missing: {', '.join(missing)}"
+        )
+    return create_engine(settings.url, pool_pre_ping=True)
+
+
+def get_source_db_engine() -> Engine:
+    return get_db_engine("source")
+
+
+def get_datamart_db_engine() -> Engine:
+    return get_db_engine("datamart")
+
+
+def get_table_samples(engine: Engine, table_name: str, sample_count: int = 10) -> list[dict]:
     try:
-        # 엔진 생성 (연결 통로 개설)
-        engine = create_engine(database_url)
-        
-        # 실제로 연결이 잘 되는지 테스트 (정상일 때만 메시지 출력)
         with engine.connect() as connection:
-            print(f"✅ DB 연결 성공: {db_name}")
-        
-        return engine
-    
-    except Exception as e:
-        print(f"❌ DB 연결 실패: {e}")
-        return None
-
-def get_table_samples(engine, table_name, sample_count=10):
-    """
-    이미지 회의 내용 반영: 테이블에서 랜덤 10개 샘플 추출
-    """
-    try:
-        with engine.connect() as connection:
-            # MySQL 기준 랜덤 샘플링
             query = text(f"SELECT * FROM `{table_name}` ORDER BY RAND() LIMIT {sample_count}")
             df = pd.read_sql(query, connection)
-            # LLM이 읽기 편하도록 리스트-딕셔너리 형태로 반환
-            return df.to_dict(orient='records')
-    except Exception as e:
-        print(f"⚠️ {table_name} 샘플 추출 실패: {e}")
+            return df.to_dict(orient="records")
+    except Exception as exc:
+        print(f"⚠️ {table_name} 샘플 추출 실패: {exc}")
         return []
-    
-    
+
+
 if __name__ == "__main__":
-    # 1. DB 연결 테스트
-    engine = get_db_engine()
-    
-    if engine:
-        # 2. 샘플 추출 테스트 (실제 테이블 명 하나를 넣어보세요)
-        # 회의 내용처럼 10개가 잘 나오는지 확인용입니다.
-        test_table = "users"  # 실제 DB에 있는 테이블명으로 변경
-        samples = get_table_samples(engine, test_table, 10)
-        
-        print(f"\n🔍 '{test_table}' 테이블 샘플 데이터 (최대 10개):")
-        for i, row in enumerate(samples, 1):
-            print(f"{i}: {row}")
-    else:
-        print("❌ 테스트 실패: 엔진을 생성할 수 없습니다.")
+    for role in ("source", "datamart"):
+        try:
+            engine = get_db_engine(role)
+            with engine.connect():
+                print(f"✅ {role} DB 연결 성공: {get_database_settings(role).name}")
+        except Exception as exc:
+            print(f"❌ {role} DB 연결 실패: {exc}")

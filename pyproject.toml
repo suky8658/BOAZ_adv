@@ -3,11 +3,20 @@ name = "sql-agent-0402"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 dependencies = [
+    "deepagents>=0.5.3",
     "dotenv>=0.9.9",
     "langchain-google-genai>=2.1.12",
     "langgraph>=0.6.11",
+    "pandas>=2.3.3",
     "pydantic>=2.12.5",
+    "pymysql>=1.1.2",
     "sqlalchemy>=2.0.48",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+    "ruff>=0.14.1",
 ]

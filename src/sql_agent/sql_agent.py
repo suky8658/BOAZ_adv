@@ -1,659 +1,297 @@
-import os
+from __future__ import annotations
+
 import json
-from typing import TypedDict, Any, Optional, List, Dict, Literal
+import os
+import re
+from typing import Any, Literal
 
+import pandas as pd
 from dotenv import load_dotenv
+from langchain_core.tools import tool
+from langgraph.checkpoint.memory import MemorySaver
 from pydantic import BaseModel, Field
-from sqlalchemy import text
-from langgraph.graph import StateGraph, START, END
-from langchain_google_genai import ChatGoogleGenerativeAI
+from sqlalchemy import inspect, text
 
-from db.db_connect import get_db_engine
+from db.db_connect import (
+    get_database_settings,
+    get_datamart_db_engine,
+    get_source_db_engine,
+)
 from validator.integrity_loader import load_all_metadata
 
 load_dotenv()
 
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-MAX_RETRIES = int(os.getenv("MAX_RETRIES", 2))
-ALLOWED_MART_SCHEMA = os.getenv("ALLOWED_MART_SCHEMA", "analytics")
+MAX_RESULT_ROWS = int(os.getenv("MAX_RESULT_ROWS", "200"))
+MAX_RESULT_PREVIEW_ROWS = int(os.getenv("MAX_RESULT_PREVIEW_ROWS", "20"))
 ALLOW_MART_WRITE = os.getenv("ALLOW_MART_WRITE", "true").lower() == "true"
+GOOGLE_MODEL = os.getenv("AGENT_MODEL", "google_genai:gemini-2.5-flash")
+CHECKPOINTER = MemorySaver()
+
+class SourceQueryPlan(BaseModel):
+    sql: str = Field(description="Source DB against read-only SELECT SQL")
+    business_grain: str = Field(description="Result grain")
+    reasoning: str = Field(description="Why this query answers the question")
 
 
-# -----------------------------
-# Pydantic Models
-# -----------------------------
-class QuestionPlan(BaseModel):
-    original_question: str = Field(description="사용자 원문 질문")
-    question_type: str = Field(description="aggregation/comparison/ranking/filter/detail/trend/identification/mart_build")
-    task_type: str = Field(description="query_answer 또는 data_mart_build")
-    requested_output: str = Field(description="sql_only / execute_and_answer / create_table")
-    target_metric: str = Field(description="핵심 지표")
-    dimensions: List[str] = Field(default_factory=list, description="그룹 기준")
-    filters: List[str] = Field(default_factory=list, description="필터 조건")
-    time_condition: Optional[str] = Field(default=None, description="시간 조건")
-    relevant_tables: List[str] = Field(default_factory=list, description="관련 테이블")
-    mart_name: Optional[str] = Field(default=None, description="생성 대상 마트명")
-    grain: Optional[str] = Field(default=None, description="마트 grain")
-    load_strategy: Optional[str] = Field(default=None, description="full_refresh / incremental")
-    ambiguity_note: Optional[str] = Field(default=None, description="애매한 표현")
+class DatamartBuildPlan(BaseModel):
+    target_table: str = Field(description="Datamart table name only, without database prefix")
+    source_sql: str = Field(description="Read-only SELECT SQL to run against the source DB")
+    grain: str = Field(description="Datamart grain")
+    load_strategy: Literal["replace", "append"] = Field(description="How to materialize the mart")
+    key_columns: list[str] = Field(default_factory=list, description="Key columns at the mart grain")
+    dimension_columns: list[str] = Field(default_factory=list, description="Dimension columns kept in the mart")
+    measure_columns: list[str] = Field(default_factory=list, description="Measure columns kept in the mart")
+    reasoning: str = Field(description="Why this mart design matches the request")
 
 
-class MartDesign(BaseModel):
-    mart_name: str
-    target_schema: str
-    grain: str
-    source_tables: List[str] = Field(default_factory=list)
-    key_columns: List[str] = Field(default_factory=list)
-    measure_columns: List[str] = Field(default_factory=list)
-    dimension_columns: List[str] = Field(default_factory=list)
-    incremental_column: Optional[str] = None
-    load_strategy: str = "full_refresh"
-    design_reasoning: str
-
-
-class SQLDraft(BaseModel):
-    sql: str
-    sql_type: str = Field(description="select / create_table_as / insert_select")
-    target_table: Optional[str] = None
-    source_tables: List[str] = Field(default_factory=list)
-    columns_used: List[str] = Field(default_factory=list)
-    business_grain: Optional[str] = None
-    precheck_sql: Optional[str] = None
-    postcheck_sql: Optional[str] = None
-    reasoning: str
-
-
-class ValidationResult(BaseModel):
-    result: str
-    reason: str
-    feedback: str
-
-
-class AgentState(TypedDict):
-    user_question: str
-    schema_text: str
-    integrity_text: str
-
-    plan: Dict[str, Any]
-    mart_design: Dict[str, Any]
-    sql_draft: Dict[str, Any]
-
-    sql_result: Any
-    row_count: int
-
-    precheck_result: Any
-    postcheck_result: Any
-    mart_quality_result: Dict[str, Any]
-
-    validation: Dict[str, Any]
-    retry_count: int
-    max_retries: int
-    feedback: str
-    error: str
-    final_answer: str
-
-
-engine = get_db_engine()
-
-llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",
-    temperature=0,
-    google_api_key=GOOGLE_API_KEY
-)
-
-
-# -----------------------------
-# Utils
-# -----------------------------
-def safe_json_parse(text_value: str, fallback: dict) -> dict:
-    cleaned = text_value.strip()
-    cleaned = cleaned.replace("```json", "").replace("```", "").strip()
-    try:
-        return json.loads(cleaned)
-    except Exception:
-        return fallback
-
-
-def clean_sql(sql: str) -> str:
-    sql = sql.replace("```sql", "").replace("```", "").strip()
-    if not sql.endswith(";"):
-        sql += ";"
-    return sql
-
-
-def format_result_rows(rows: Any, max_rows: int = 10) -> str:
+def format_rows(rows: list[dict[str, Any]], max_rows: int = MAX_RESULT_PREVIEW_ROWS) -> str:
     if not rows:
         return "결과 없음"
     preview = rows[:max_rows]
-    return "\n".join([str(tuple(r)) for r in preview])
+    return json.dumps(preview, ensure_ascii=False, indent=2, default=str)
 
 
-def is_safe_query_sql(sql: str) -> bool:
-    lowered = sql.strip().lower()
-    if lowered.startswith("select") or lowered.startswith("with"):
-        banned = ["insert ", "update ", "delete ", "drop ", "alter ", "truncate ", "create "]
-        return not any(k in lowered for k in banned)
-    return False
+def _normalize_sql(sql: str) -> str:
+    cleaned = sql.replace("```sql", "").replace("```", "").strip()
+    if not cleaned.endswith(";"):
+        cleaned += ";"
+    return cleaned
 
 
-def is_safe_mart_sql(sql: str, target_table: Optional[str]) -> tuple[bool, str]:
-    lowered = sql.strip().lower()
+def is_safe_select_sql(sql: str) -> bool:
+    lowered = _normalize_sql(sql).lower()
+    if not (lowered.startswith("select") or lowered.startswith("with")):
+        return False
 
-    if not ALLOW_MART_WRITE:
-        return False, "현재 설정상 마트 생성 SQL 실행이 비활성화되어 있습니다."
-
-    banned = [
-        "drop database", "drop schema", "truncate ", "alter table",
-        "grant ", "revoke ", "rename table"
+    banned_patterns = [
+        r"\binsert\b",
+        r"\bupdate\b",
+        r"\bdelete\b",
+        r"\bdrop\b",
+        r"\balter\b",
+        r"\btruncate\b",
+        r"\bcreate\b",
+        r"\breplace\b",
+        r"\bgrant\b",
+        r"\brevoke\b",
+        r"\brename\b",
+        r";\s*\S",
     ]
-    if any(k in lowered for k in banned):
-        return False, "위험한 DDL/DCL 문이 포함되어 있습니다."
-
-    allowed_prefixes = [
-        "create table",
-        "create or replace table",
-        "insert into"
-    ]
-    if not any(lowered.startswith(p) for p in allowed_prefixes):
-        return False, "허용되지 않은 마트 생성 SQL 형식입니다."
-
-    if target_table:
-        target_table_lower = target_table.lower()
-        if ALLOWED_MART_SCHEMA.lower() not in target_table_lower:
-            return False, f"타겟 테이블은 허용된 스키마({ALLOWED_MART_SCHEMA}) 안에 있어야 합니다."
-
-    return True, ""
+    return not any(re.search(pattern, lowered) for pattern in banned_patterns)
 
 
-def run_sql_fetchall(sql: str):
+def is_safe_datamart_table_name(table_name: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", table_name))
+
+
+def _run_select(engine, sql: str) -> pd.DataFrame:
+    query = _normalize_sql(sql)
+    if not is_safe_select_sql(query):
+        raise ValueError("읽기 전용 SELECT SQL만 허용됩니다.")
     with engine.connect() as conn:
-        return conn.execute(text(sql)).fetchall()
+        return pd.read_sql(text(query), conn)
 
 
-def run_sql_commit(sql: str):
-    with engine.begin() as conn:
-        conn.execute(text(sql))
+def _get_source_engine():
+    return get_source_db_engine()
 
 
-# -----------------------------
-# Nodes
-# -----------------------------
-def load_context(state: AgentState):
-    metadata = load_all_metadata()
-    return {
-        "schema_text": metadata["schema_text"],
-        "integrity_text": metadata["integrity_text"],
+def _get_datamart_engine():
+    return get_datamart_db_engine()
+
+
+def _get_datamart_metadata() -> dict[str, Any]:
+    settings = get_database_settings("datamart")
+    payload: dict[str, Any] = {
+        "datamart_database": settings.name or "analytics",
     }
-
-
-def plan_question(state: AgentState):
-    prompt = f"""
-너는 MySQL 기반 SQL/데이터마트 설계 질문 분석기다.
-
-사용자 질문:
-{state['user_question']}
-
-스키마 JSON:
-{state['schema_text']}
-
-정합성 점검 JSON:
-{state['integrity_text']}
-
-규칙:
-- task_type은 반드시 query_answer 또는 data_mart_build 중 하나
-- 사용자가 "데이터마트", "마트 생성", "집계 테이블", "요약 테이블", "분석용 테이블 생성" 의도를 가지면 data_mart_build
-- requested_output은 sql_only / execute_and_answer / create_table 중 하나
-- relevant_tables는 실제 존재하는 테이블만
-- 질문에 없는 조건 임의 추가 금지
-- 애매한 점은 ambiguity_note에 기록
-- 반드시 JSON만 출력
-
-출력 형식:
-{{
-  "original_question": "...",
-  "question_type": "...",
-  "task_type": "...",
-  "requested_output": "...",
-  "target_metric": "...",
-  "dimensions": ["..."],
-  "filters": ["..."],
-  "time_condition": "... 또는 null",
-  "relevant_tables": ["..."],
-  "mart_name": "... 또는 null",
-  "grain": "... 또는 null",
-  "load_strategy": "... 또는 null",
-  "ambiguity_note": "... 또는 null"
-}}
-"""
-    response = llm.invoke(prompt).content
-
-    fallback = QuestionPlan(
-        original_question=state["user_question"],
-        question_type="unknown",
-        task_type="query_answer",
-        requested_output="execute_and_answer",
-        target_metric="unknown",
-        dimensions=[],
-        filters=[],
-        time_condition=None,
-        relevant_tables=[],
-        mart_name=None,
-        grain=None,
-        load_strategy=None,
-        ambiguity_note="질문 분석 파싱 실패"
-    ).model_dump()
-
-    parsed = safe_json_parse(response, fallback)
-    parsed["original_question"] = state["user_question"]
-
-    return {"plan": parsed}
-
-
-def design_mart(state: AgentState):
-    if state["plan"].get("task_type") != "data_mart_build":
-        return {"mart_design": {}}
-
-    prompt = f"""
-너는 분석용 데이터마트 설계자다.
-
-사용자 질문:
-{state['user_question']}
-
-질문 분석 결과:
-{json.dumps(state['plan'], ensure_ascii=False, indent=2)}
-
-스키마 JSON:
-{state['schema_text']}
-
-정합성 점검 JSON:
-{state['integrity_text']}
-
-설계 규칙:
-- 분석에 재사용 가능한 데이터마트 기준으로 설계
-- grain을 반드시 명확히 정의
-- key_columns, dimension_columns, measure_columns를 분리
-- target_schema는 "{ALLOWED_MART_SCHEMA}" 로 고정
-- incremental이 자연스러우면 incremental_column 제안
-- 질문에 없는 정의를 과도하게 추가하지 말고 reasoning에 근거 설명
-- 반드시 JSON만 출력
-
-출력 형식:
-{{
-  "mart_name": "...",
-  "target_schema": "{ALLOWED_MART_SCHEMA}",
-  "grain": "...",
-  "source_tables": ["..."],
-  "key_columns": ["..."],
-  "measure_columns": ["..."],
-  "dimension_columns": ["..."],
-  "incremental_column": "... 또는 null",
-  "load_strategy": "full_refresh 또는 incremental",
-  "design_reasoning": "..."
-}}
-"""
-    response = llm.invoke(prompt).content
-
-    fallback = MartDesign(
-        mart_name=state["plan"].get("mart_name") or "mart_unknown",
-        target_schema=ALLOWED_MART_SCHEMA,
-        grain=state["plan"].get("grain") or "grain 미정",
-        source_tables=state["plan"].get("relevant_tables", []),
-        key_columns=[],
-        measure_columns=[],
-        dimension_columns=[],
-        incremental_column=None,
-        load_strategy=state["plan"].get("load_strategy") or "full_refresh",
-        design_reasoning="마트 설계 파싱 실패"
-    ).model_dump()
-
-    parsed = safe_json_parse(response, fallback)
-    return {"mart_design": parsed}
-
-
-def generate_sql(state: AgentState):
-    feedback = state.get("feedback", "").strip()
-    task_type = state["plan"].get("task_type", "query_answer")
-
-    if task_type == "data_mart_build":
-        prompt = f"""
-너는 MySQL 데이터마트 생성 SQL 작성기다.
-
-사용자 질문:
-{state['user_question']}
-
-질문 분석 결과:
-{json.dumps(state['plan'], ensure_ascii=False, indent=2)}
-
-마트 설계 결과:
-{json.dumps(state.get('mart_design', {}), ensure_ascii=False, indent=2)}
-
-스키마 JSON:
-{state['schema_text']}
-
-정합성 점검 JSON:
-{state['integrity_text']}
-
-이전 피드백:
-{feedback if feedback else "없음"}
-
-규칙:
-- CREATE TABLE ... AS SELECT 또는 INSERT INTO ... SELECT 형태만 허용
-- 타겟 스키마는 반드시 {ALLOWED_MART_SCHEMA}
-- source는 실제 존재 테이블만 사용
-- grain이 깨지지 않게 집계
-- 모호한 기준은 reasoning에 명시
-- precheck_sql에는 원천 데이터 건수/기간 확인용 SELECT
-- postcheck_sql에는 생성 후 row_count / 중복 / null 점검용 SELECT
-- DROP, ALTER, TRUNCATE 금지
-- 반드시 JSON만 출력
-
-출력 형식:
-{{
-  "sql": "...",
-  "sql_type": "create_table_as 또는 insert_select",
-  "target_table": "{ALLOWED_MART_SCHEMA}.xxx",
-  "source_tables": ["..."],
-  "columns_used": ["..."],
-  "business_grain": "...",
-  "precheck_sql": "SELECT ...",
-  "postcheck_sql": "SELECT ...",
-  "reasoning": "..."
-}}
-"""
-    else:
-        prompt = f"""
-너는 MySQL 조회 SQL 작성기다.
-
-사용자 질문:
-{state['user_question']}
-
-질문 분석 결과:
-{json.dumps(state['plan'], ensure_ascii=False, indent=2)}
-
-스키마 JSON:
-{state['schema_text']}
-
-정합성 점검 JSON:
-{state['integrity_text']}
-
-이전 피드백:
-{feedback if feedback else "없음"}
-
-규칙:
-- MySQL SELECT SQL만 생성
-- WITH 절 허용
-- 질문에 없는 조건 임의 추가 금지
-- 정합성 문제가 있는 컬럼/테이블 주의
-- 반드시 JSON만 출력
-
-출력 형식:
-{{
-  "sql": "SELECT ...",
-  "sql_type": "select",
-  "target_table": null,
-  "source_tables": ["..."],
-  "columns_used": ["..."],
-  "business_grain": null,
-  "precheck_sql": null,
-  "postcheck_sql": null,
-  "reasoning": "..."
-}}
-"""
-
-    response = llm.invoke(prompt).content
-
-    fallback = SQLDraft(
-        sql="SELECT 1;",
-        sql_type="select",
-        target_table=None,
-        source_tables=[],
-        columns_used=[],
-        business_grain=None,
-        precheck_sql=None,
-        postcheck_sql=None,
-        reasoning="SQL 생성 파싱 실패"
-    ).model_dump()
-
-    parsed = safe_json_parse(response, fallback)
-    parsed["sql"] = clean_sql(parsed.get("sql", "SELECT 1;"))
-
-    if parsed.get("precheck_sql"):
-        parsed["precheck_sql"] = clean_sql(parsed["precheck_sql"])
-    if parsed.get("postcheck_sql"):
-        parsed["postcheck_sql"] = clean_sql(parsed["postcheck_sql"])
-
-    return {"sql_draft": parsed}
-
-
-def execute_sql(state: AgentState):
-    sql = state["sql_draft"]["sql"].strip()
-    sql_type = state["sql_draft"].get("sql_type", "select")
-    target_table = state["sql_draft"].get("target_table")
-
     try:
-        pre_rows = None
-        if state["sql_draft"].get("precheck_sql"):
-            pre_rows = run_sql_fetchall(state["sql_draft"]["precheck_sql"])
+        datamart_engine = _get_datamart_engine()
+        payload["datamart_status"] = "available"
+        payload["datamart_schema"] = _introspect_tables(datamart_engine)
+    except Exception as exc:
+        payload["datamart_status"] = "unavailable"
+        payload["datamart_schema"] = {}
+        payload["datamart_error"] = str(exc)
+    return payload
 
-        if sql_type == "select":
-            if not is_safe_query_sql(sql):
-                return {
-                    "sql_result": None,
-                    "row_count": 0,
-                    "precheck_result": pre_rows,
-                    "postcheck_result": None,
-                    "error": "조회 SQL 안전성 검사 실패"
+
+def _introspect_tables(engine) -> dict[str, Any]:
+    inspector = inspect(engine)
+    tables: dict[str, Any] = {}
+    for table_name in inspector.get_table_names():
+        columns = inspector.get_columns(table_name)
+        tables[table_name] = {
+            "columns": [
+                {
+                    "name": column["name"],
+                    "type": str(column["type"]),
+                    "nullable": bool(column["nullable"]),
                 }
-
-            rows = run_sql_fetchall(sql)
-
-            return {
-                "sql_result": rows,
-                "row_count": len(rows),
-                "precheck_result": pre_rows,
-                "postcheck_result": None,
-                "error": ""
-            }
-
-        ok, reason = is_safe_mart_sql(sql, target_table)
-        if not ok:
-            return {
-                "sql_result": None,
-                "row_count": 0,
-                "precheck_result": pre_rows,
-                "postcheck_result": None,
-                "error": reason
-            }
-
-        run_sql_commit(sql)
-
-        post_rows = None
-        if state["sql_draft"].get("postcheck_sql"):
-            post_rows = run_sql_fetchall(state["sql_draft"]["postcheck_sql"])
-
-        return {
-            "sql_result": [("마트 생성 완료", target_table)],
-            "row_count": 1,
-            "precheck_result": pre_rows,
-            "postcheck_result": post_rows,
-            "error": ""
+                for column in columns
+            ]
         }
-
-    except Exception as e:
-        return {
-            "sql_result": None,
-            "row_count": 0,
-            "precheck_result": None,
-            "postcheck_result": None,
-            "error": str(e)
-        }
+    return tables
 
 
-def validate_sql_and_result(state: AgentState):
-    if state.get("error"):
-        parsed = ValidationResult(
-            result="invalid",
-            reason=f"SQL 실행 오류: {state['error']}",
-            feedback="실행 오류를 해결하고 task_type에 맞는 MySQL SQL로 다시 생성하라."
-        ).model_dump()
-        return {"validation": parsed, "feedback": parsed["feedback"]}
-
-    prompt = f"""
-너는 SQL/데이터마트 검증기다.
-
-사용자 질문:
-{state['user_question']}
-
-질문 분석 결과:
-{json.dumps(state['plan'], ensure_ascii=False, indent=2)}
-
-마트 설계 결과:
-{json.dumps(state.get('mart_design', {}), ensure_ascii=False, indent=2)}
-
-정합성 점검 JSON:
-{state['integrity_text']}
-
-생성된 SQL:
-{state['sql_draft']['sql']}
-
-SQL 설명:
-{state['sql_draft']['reasoning']}
-
-사전 점검 결과:
-{format_result_rows(state.get('precheck_result'))}
-
-실행 결과:
-{format_result_rows(state['sql_result'])}
-
-사후 점검 결과:
-{format_result_rows(state.get('postcheck_result'))}
-
-행 수:
-{state['row_count']}
-
-검증 규칙:
-1. task_type=query_answer 이면 질문 조건 충족 여부 검증
-2. task_type=data_mart_build 이면 grain 적합성, 타겟 테이블 적절성, 재사용성 검증
-3. 질문에 없는 조건 추가면 invalid
-4. 정합성 문제 무시하면 invalid
-5. 반드시 JSON만 출력
-
-출력 형식:
-{{
-  "result": "valid" 또는 "invalid",
-  "reason": "...",
-  "feedback": "..."
-}}
-"""
-    response = llm.invoke(prompt).content
-
-    fallback = ValidationResult(
-        result="invalid",
-        reason="검증 결과 파싱 실패",
-        feedback="질문 조건, grain, 정합성 점검 내용을 반영해 다시 SQL을 생성하라."
-    ).model_dump()
-
-    parsed = safe_json_parse(response, fallback)
-    return {"validation": parsed, "feedback": parsed.get("feedback", "")}
+@tool
+def get_metadata_context() -> str:
+    """Load source schema/integrity metadata and current datamart table metadata."""
+    metadata = load_all_metadata()
+    payload = {
+        "source_schema": metadata["schema_json"],
+        "source_integrity": metadata["integrity_json"],
+    }
+    payload.update(_get_datamart_metadata())
+    return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
-def finalize_answer(state: AgentState):
-    if state["validation"].get("result") != "valid":
-        return {
-            "final_answer": (
-                "검증 실패\n"
-                f"사유: {state['validation'].get('reason')}\n"
-                f"마지막 SQL: {state['sql_draft'].get('sql')}"
-            )
-        }
-
-    if state["plan"].get("task_type") == "data_mart_build":
-        prompt = f"""
-너는 데이터 엔지니어/분석가용 결과 요약기다.
-
-사용자 질문:
-{state['user_question']}
-
-마트 설계:
-{json.dumps(state.get('mart_design', {}), ensure_ascii=False, indent=2)}
-
-생성 SQL:
-{state['sql_draft']['sql']}
-
-사전 점검 결과:
-{format_result_rows(state.get('precheck_result'))}
-
-사후 점검 결과:
-{format_result_rows(state.get('postcheck_result'))}
-
-규칙:
-- 한국어
-- 마트명, grain, 적재 방식, 핵심 컬럼, 검증 결과를 짧게 요약
-- 없는 내용 추측 금지
-"""
-        answer = llm.invoke(prompt).content.strip()
-        return {"final_answer": answer}
-
-    prompt = f"""
-너는 데이터 분석 답변 작성기다.
-
-사용자 질문:
-{state['user_question']}
-
-SQL 결과:
-{format_result_rows(state['sql_result'], max_rows=20)}
-
-규칙:
-- 한국어
-- 핵심 결과 먼저
-- 없는 내용 추측 금지
-- 결과 범위 안에서만 설명
-"""
-    answer = llm.invoke(prompt).content.strip()
-    return {"final_answer": answer}
+@tool
+def run_source_query(sql: str) -> str:
+    """Execute a read-only SELECT query against the source database and return a JSON preview."""
+    df = _run_select(_get_source_engine(), sql)
+    rows = df.head(MAX_RESULT_ROWS).to_dict(orient="records")
+    payload = {
+        "row_count": int(len(df)),
+        "columns": list(df.columns),
+        "rows": rows,
+        "preview": format_rows(rows),
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
 
 
-def increase_retry(state: AgentState):
-    return {"retry_count": state["retry_count"] + 1}
+@tool
+def run_datamart_query(sql: str) -> str:
+    """Execute a read-only SELECT query against the datamart database and return a JSON preview."""
+    try:
+        datamart_engine = _get_datamart_engine()
+    except Exception as exc:
+        raise ValueError(f"datamart DB를 사용할 수 없습니다. {exc}") from exc
+
+    df = _run_select(datamart_engine, sql)
+    rows = df.head(MAX_RESULT_ROWS).to_dict(orient="records")
+    payload = {
+        "row_count": int(len(df)),
+        "columns": list(df.columns),
+        "rows": rows,
+        "preview": format_rows(rows),
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
 
 
-def route_after_validation(state: AgentState):
-    if state["validation"].get("result") == "valid":
-        return "finalize"
-    if state["retry_count"] >= state["max_retries"]:
-        return "finalize"
-    return "retry"
+@tool
+def materialize_datamart(
+    target_table: str,
+    source_sql: str,
+    load_strategy: Literal["replace", "append"] = "replace",
+) -> str:
+    """Run a read-only source SELECT and materialize its result into the datamart database."""
+    if not ALLOW_MART_WRITE:
+        raise ValueError("현재 설정상 datamart 쓰기가 비활성화되어 있습니다.")
+    if not is_safe_datamart_table_name(target_table):
+        raise ValueError("target_table은 영문/숫자/언더스코어만 포함한 단일 테이블명이어야 합니다.")
+
+    source_engine = _get_source_engine()
+    try:
+        datamart_engine = _get_datamart_engine()
+    except Exception as exc:
+        raise ValueError(
+            "datamart DB를 사용할 수 없습니다. "
+            "DATAMART_DB_* 또는 fallback SOURCE_DB_* 설정을 확인하세요. "
+            f"원인: {exc}"
+        ) from exc
+
+    df = _run_select(source_engine, source_sql)
+    df.to_sql(target_table, datamart_engine, if_exists=load_strategy, index=False)
+
+    verification_sql = f"SELECT COUNT(*) AS row_count FROM `{target_table}`;"
+    verify_df = _run_select(datamart_engine, verification_sql)
+    payload = {
+        "target_database": datamart_engine.url.database,
+        "target_table": target_table,
+        "load_strategy": load_strategy,
+        "source_row_count": int(len(df)),
+        "datamart_row_count": int(verify_df.iloc[0]["row_count"]),
+        "columns": list(df.columns),
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+
+
+def _main_agent_prompt() -> str:
+    datamart_db_name = get_database_settings("datamart").name or "analytics"
+    return f"""
+너는 SQL 분석과 datamart 구축을 함께 수행하는 한국어 데이터 에이전트다.
+
+중요한 운영 규칙:
+- source DB와 datamart DB는 분리되어 있다.
+- source DB는 조회 전용이다. source DB에 쓰기 SQL을 실행하면 안 된다.
+- datamart 구축은 반드시 `materialize_datamart` 도구를 사용한다.
+- datamart 구축을 위해서는 source DB에서 읽기 전용 SELECT를 만든 뒤, 그 결과를 datamart DB({datamart_db_name})에 적재한다.
+- datamart 테이블명은 데이터베이스 접두어 없이 단일 테이블명만 사용한다.
+- source metadata가 필요하면 먼저 `get_metadata_context`를 호출한다.
+- query_answer 요청은 보통 `source-sql-analyst`에게 위임하고, datamart 구축 요청은 `datamart-engineer`에게 위임한다.
+- 답변에는 추측을 넣지 말고, 실제 조회/적재 결과에 근거해서만 설명한다.
+""".strip()
+
+
+def _source_subagent_prompt() -> str:
+    return """
+너는 source DB 전용 SQL 분석가다.
+
+역할:
+- 자연어 질문을 source DB용 읽기 전용 SELECT SQL로 변환한다.
+- 답을 만들기 전에 필요하면 `get_metadata_context`와 `run_source_query`를 사용해 검증한다.
+
+제약:
+- SELECT 또는 WITH ... SELECT만 허용한다.
+- source DB에 쓰기 SQL을 제안하거나 실행하면 안 된다.
+- 결과는 반드시 구조화된 JSON 스키마에 맞춰 반환한다.
+""".strip()
+
+
+def _datamart_subagent_prompt() -> str:
+    return """
+너는 datamart 설계 및 적재 전용 엔지니어다.
+
+역할:
+- 사용자의 mart 요구를 source DB 기반 SELECT와 datamart 테이블 설계로 바꾼다.
+- 필요하면 `get_metadata_context`, `run_source_query`, `run_datamart_query`를 사용해 grain과 컬럼을 검증한다.
+
+제약:
+- datamart 적재는 상위 에이전트가 `materialize_datamart`로 수행하므로, 너는 source SELECT와 테이블 설계를 명확히 제시해야 한다.
+- target_table은 데이터베이스 이름 없이 단일 테이블명만 반환한다.
+- 결과는 반드시 구조화된 JSON 스키마에 맞춰 반환한다.
+""".strip()
 
 
 def build_app():
-    graph = StateGraph(AgentState)
+    from deepagents import create_deep_agent
 
-    graph.add_node("load_context", load_context)
-    graph.add_node("plan_question", plan_question)
-    graph.add_node("design_mart", design_mart)
-    graph.add_node("generate_sql", generate_sql)
-    graph.add_node("execute_sql", execute_sql)
-    graph.add_node("validate_sql_and_result", validate_sql_and_result)
-    graph.add_node("increase_retry", increase_retry)
-    graph.add_node("finalize_answer", finalize_answer)
-
-    graph.add_edge(START, "load_context")
-    graph.add_edge("load_context", "plan_question")
-    graph.add_edge("plan_question", "design_mart")
-    graph.add_edge("design_mart", "generate_sql")
-    graph.add_edge("generate_sql", "execute_sql")
-    graph.add_edge("execute_sql", "validate_sql_and_result")
-
-    graph.add_conditional_edges(
-        "validate_sql_and_result",
-        route_after_validation,
+    subagents = [
         {
-            "retry": "increase_retry",
-            "finalize": "finalize_answer"
-        }
+            "name": "source-sql-analyst",
+            "description": "Natural-language question to read-only source SQL plan",
+            "system_prompt": _source_subagent_prompt(),
+            "tools": [get_metadata_context, run_source_query],
+            "response_format": SourceQueryPlan,
+        },
+        {
+            "name": "datamart-engineer",
+            "description": "Designs a datamart using source SELECTs and separated datamart loading",
+            "system_prompt": _datamart_subagent_prompt(),
+            "tools": [get_metadata_context, run_source_query, run_datamart_query],
+            "response_format": DatamartBuildPlan,
+        },
+    ]
+
+    return create_deep_agent(
+        model=GOOGLE_MODEL,
+        name="sql-agent",
+        system_prompt=_main_agent_prompt(),
+        tools=[get_metadata_context, run_source_query, run_datamart_query, materialize_datamart],
+        subagents=subagents,
+        interrupt_on={
+            "materialize_datamart": {"allowed_decisions": ["approve", "reject"]},
+        },
+        checkpointer=CHECKPOINTER,
     )
-
-    graph.add_edge("increase_retry", "generate_sql")
-    graph.add_edge("finalize_answer", END)
-
-    return graph.compile()
