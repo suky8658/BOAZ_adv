@@ -17,5 +17,6 @@ wheels/
 *.db
 *.sqlite3
 *.json
+gx/uncommitted/
 
 .DS_Store
