@@ -1,0 +1,16 @@
+# 환경변수 (API 키 — 절대 업로드 금지)
+.env
+
+# 임시 데이터
+db/datamart_temp*.csv
+
+# 차트 PNG (폴더 구조는 유지, 파일만 제외)
+outputs/**/*.png
+
+# Python 캐시
+__pycache__/
+*.pyc
+*.pyo
+
+# Jupyter 체크포인트
+.ipynb_checkpoints/
