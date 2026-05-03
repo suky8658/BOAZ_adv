@@ -1,0 +1,13 @@
+---
+title: Analysis Agent 0416
+---
+flowchart TD
+    START([START]) --> load_context[load_context]
+    load_context --> plan_analysis[plan_analysis]
+    plan_analysis --> generate_python_code[generate_python_code]
+    generate_python_code --> execute_analysis[execute_analysis]
+    execute_analysis --> validate_result[validate_result]
+    validate_result -->|retry| increase_retry[increase_retry]
+    increase_retry --> generate_python_code
+    validate_result -->|finalize| finalize_answer[finalize_answer]
+    finalize_answer --> END([END])
